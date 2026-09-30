@@ -1,2 +1,2 @@
 textual>=8.0
-python-vlc>=3.0
+python-vlc>=3.0,<4  # needs VLC 3.x installed (VLC 4 changed the libvlc API)

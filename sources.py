@@ -7,12 +7,15 @@ Podcasts: Apple Podcasts directory (search + charts) + the podcast's own RSS fee
 """
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import random
 import re
+import unicodedata
 import urllib.parse
 import urllib.request
+import zlib
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from typing import Callable
@@ -34,6 +37,13 @@ class Item:
     url: str = ""  # set when directly playable
     ref: dict = field(default_factory=dict)  # set when it expands into more items
 
+    def __post_init__(self) -> None:
+        # APIs sometimes send numbers/None for text (e.g. a ccMixter upload named "5" arrives as 5)
+        for f in ("kind", "title", "subtitle", "info", "meta", "source", "url"):
+            v = getattr(self, f)
+            if not isinstance(v, str):
+                setattr(self, f, "" if v is None else str(v))
+
     @property
     def playable(self) -> bool:
         return bool(self.url)
@@ -49,6 +59,30 @@ class Item:
 def item_from_dict(d: dict) -> Item:
     fields = Item.__dataclass_fields__
     return Item(**{k: v for k, v in d.items() if k in fields})
+
+
+SHARE_PREFIX = "termradio:"
+
+
+def share_id(item: Item) -> str:
+    """A copy-pasteable code for an item, e.g. termradio:audius:track:eJyr…; paste it in any search box."""
+    data = {k: v for k, v in item.to_dict().items() if v}
+    blob = base64.urlsafe_b64encode(zlib.compress(json.dumps(data, separators=(",", ":")).encode(), 9))
+    hint = "-".join(re.sub(r"[^\w.-]+", "-", x) for x in (item.source or "item", item.kind))
+    return f"{SHARE_PREFIX}{hint}:{blob.decode().rstrip('=')}"
+
+
+def is_share_id(s: str) -> bool:
+    return s.strip().lower().startswith(SHARE_PREFIX)
+
+
+def from_share_id(s: str) -> Item:
+    blob = s.strip().rsplit(":", 1)[-1]
+    try:
+        data = json.loads(zlib.decompress(base64.urlsafe_b64decode(blob + "=" * (-len(blob) % 4))))
+        return item_from_dict(data)
+    except Exception:
+        raise ValueError("That ID looks incomplete or mistyped") from None
 
 
 # ---------------------------------------------------------------- http helpers
@@ -388,10 +422,12 @@ def ccmixter(tags: str = "", search: str = "") -> list[Item]:
     params = {"f": "json", "limit": 100, "sort": "rank"}
     if tags:
         params["tags"] = tags
-    if search:
+    uploads = []
+    if search:  # prefer uploads matching every word; "any" alone ranks unrelated popular tracks first
+        uploads = get_json("https://ccmixter.org/api/query", {**params, "search": search, "search_type": "all"})
         params.update(search=search, search_type="any")
     out = []
-    for u in get_json("https://ccmixter.org/api/query", params):
+    for u in uploads or get_json("https://ccmixter.org/api/query", params):
         mp3 = next((f.get("download_url") for f in u.get("files", [])
                     if (f.get("download_url") or "").lower().endswith(".mp3")), None)
         if not mp3:
@@ -481,8 +517,36 @@ def expand(item: Item) -> list[Item]:
     raise RuntimeError(f"Don't know how to open {item.title!r}")
 
 
-def search_all(loaders: list[Callable[[], list[Item]]]) -> list[Item]:
-    """Run several searches concurrently, interleave results, ignore the ones that fail."""
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s.lower())
+    return " ".join(re.sub(r"[^\w]+", " ", "".join(c for c in s if not unicodedata.combining(c))).split())
+
+
+def relevance(q: str, it: Item) -> float:
+    """How well an item's title/artist matches the query: exact > whole phrase > all words > some words."""
+    qn = _norm(q)
+    if not qn:
+        return 0.0
+    title, artist = _norm(it.title), _norm(it.subtitle)
+    words = f"{artist} {title}".split()
+    hits = 0.0
+    for w in qn.split():
+        hits += 1 if w in words else 0.5 if any(x.startswith(w) for x in words) else 0
+    score = 40 * hits / len(qn.split())
+    if qn in (title, artist):
+        score += 60
+    elif f" {qn} " in f" {title} " or f" {qn} " in f" {artist} ":
+        score += 40
+    elif f" {qn} " in f" {artist} {title} " or f" {qn} " in f" {title} {artist} ":
+        score += 25
+    if score == 0 and any(w in _norm(it.info).split() for w in qn.split()):
+        score = 5  # only the tags/description match
+    return score
+
+
+def search_all(loaders: list[Callable[[], list[Item]]], q: str = "") -> list[Item]:
+    """Run several searches concurrently, interleave results, ignore the ones that fail.
+    With a query, best matches come first; ties keep the interleaved (per-source rank) order."""
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(len(loaders)) as ex:
@@ -498,4 +562,6 @@ def search_all(loaders: list[Callable[[], list[Item]]]) -> list[Item]:
         for r in results:
             if i < len(r):
                 out.append(r[i])
+    if q:
+        out.sort(key=lambda it: -relevance(q, it))
     return out
