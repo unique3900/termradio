@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "termradio"
+version = "0.1.1"
+description = "Radio, music and podcasts in your terminal. No API keys."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Parashar Nupane" }]
+keywords = ["radio", "podcasts", "music", "terminal", "tui", "textual", "vlc"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio :: Players",
+]
+dependencies = [
+  "textual>=8.0",
+  "python-vlc>=3.0,<4",
+]
+
+[project.urls]
+Homepage = "https://github.com/unique3900/red-aio"
+Source = "https://github.com/unique3900/red-aio"
+Issues = "https://github.com/unique3900/red-aio/issues"
+
+[project.scripts]
+termradio = "termradio.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/termradio"]

@@ -3,17 +3,15 @@
 Radio, music and podcasts in your terminal. No browser, no API keys, no extra executables:
 audio goes through the VLC you already have installed (`python-vlc` loads `libvlc.dll` from it).
 
+## Install
+
 ```
-python C:\Users\parashar\termradio\termradio.py
-python C:\Users\parashar\termradio\termradio.py --country IN   # podcast charts for India (remembered)
+pip install termradio
+termradio
+termradio --country IN   # podcast charts for India (remembered)
 ```
 
-Shortcut: type `claude-m` in any PowerShell window, from any folder (`claude-m --country IN` works too).
-It is defined in your PowerShell profile, `C:\Users\parashar\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1`:
-
-```powershell
-function claude-m { python "C:\Users\parashar\termradio\termradio.py" @args }
-```
+Needs Python 3.9+ and [VLC 3.x](https://www.videolan.org/vlc/) installed (the app plays audio through it).
 
 ## What's in it
 
@@ -55,7 +53,7 @@ e.g. `country:IN tag:bollywood` or `mirchi country:IN`.
 
 ## Files
 
-- `termradio.py`: the terminal UI (Textual)
+- `app.py`: the terminal UI (Textual)
 - `sources.py`: every data source. All are free and need no key
 - `player.py`: playback through libvlc
 - If audio won't start, termradio says why and exits: VLC missing, 32-bit VLC with 64-bit Python
@@ -70,9 +68,3 @@ e.g. `country:IN tag:bollywood` or `mirchi country:IN`.
 - ccMixter refuses hotlinks without a Referer header. The player sends the stream's own site as the Referer.
 - Podcast URLs often chain 4–6 tracking redirects, which VLC won't follow, so they're resolved in Python first.
 - Radio streams that drop reconnect automatically, up to 3 times in a row.
-
-Install / update the two dependencies:
-
-```
-python -m pip install --user -r C:\Users\parashar\termradio\requirements.txt
-```
