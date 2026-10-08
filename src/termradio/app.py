@@ -6,7 +6,9 @@
 Keys:  enter play/open   backspace back   / search   space pause   s stop
        n / p next/prev   + / - volume     m mute     [ / ] seek -15s/+30s   , / . seek -5s/+5s
        click or drag the progress bar to jump anywhere in a track / episode
-       f favourite       c copy share ID  t sleep timer    1-5 tabs   q quit
+       f favourite       c copy share ID  t sleep timer    1-6 tabs   q quit
+       a add to playlist  o sort (favourites / playlists)  shift+up/down move row
+       delete remove from playlist (or delete the playlist from its sidebar)   r rename playlist
 """
 from __future__ import annotations
 
@@ -16,15 +18,16 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.events import DescendantFocus
-from textual.widgets import (Button, DataTable, Footer, Header, Input, OptionList, Static, TabbedContent,
+from textual.widgets import (Button, DataTable, Footer, Header, Input, Label, OptionList, Static, TabbedContent,
                              TabPane)
 from textual.widgets.option_list import Option
 from textual.worker import get_current_worker
@@ -34,6 +37,7 @@ from .player import Player, PlayerError
 
 STATE_FILE = Path.home() / ".termradio" / "state.json"
 SLEEP_STEPS = [0, 15, 30, 60, 90]
+NEW_PLAYLIST = "pl-new"  # sidebar / picker entry that creates a playlist
 
 Loader = Callable[[], list[S.Item]]
 
@@ -56,11 +60,33 @@ def system_copy(text: str) -> bool:
     return False
 
 
+SORT_MODES = ["custom", "name", "added", "type", "source"]
+SORT_LABELS = {"custom": "custom", "name": "name", "added": "date added", "type": "type", "source": "source"}
+
+
+def sort_items(items: list[S.Item], mode: str) -> list[S.Item]:
+    """A sorted copy for display; "custom" is the stored (hand-arranged) order."""
+    if mode == "name":
+        return sorted(items, key=lambda i: i.title.casefold())
+    if mode == "added":  # newest first; entries saved before stamps existed keep their stored order
+        return sorted(items, key=lambda i: -getattr(i, "added", 0.0))
+    if mode == "type":
+        return sorted(items, key=lambda i: (i.kind, i.title.casefold()))
+    if mode == "source":
+        return sorted(items, key=lambda i: (i.source.casefold(), i.title.casefold()))
+    return list(items)
+
+
+def stamped(item: S.Item) -> dict:
+    return {**item.to_dict(), "added": time.time()}
+
+
 class Store:
-    """Favourites, history, volume and podcast resume positions in one JSON file."""
+    """Favourites, playlists, history, volume and podcast resume positions in one JSON file."""
 
     def __init__(self) -> None:
-        self.data = {"volume": 70, "country": "US", "favorites": [], "history": [], "positions": {}}
+        self.data = {"volume": 70, "country": "US", "favorites": [], "history": [], "positions": {},
+                     "playlists": [], "sort": {}}
         try:
             self.data.update(json.loads(STATE_FILE.read_text("utf-8")))
         except Exception:
@@ -76,8 +102,17 @@ class Store:
         except Exception:
             pass
 
+    @staticmethod
+    def _items(dicts: list[dict]) -> list[S.Item]:
+        out = []
+        for d in dicts:
+            it = S.item_from_dict(d)
+            it.added = d.get("added", 0.0)  # type: ignore[attr-defined]  # for sorting; not part of the Item
+            out.append(it)
+        return out
+
     def items(self, name: str) -> list[S.Item]:
-        return [S.item_from_dict(d) for d in self.data[name]]
+        return self._items(self.data[name])
 
     def is_fav(self, item: S.Item) -> bool:
         return item.key in self._fav_keys
@@ -88,7 +123,7 @@ class Store:
             self._fav_keys.discard(item.key)
             added = False
         else:
-            self.data["favorites"].insert(0, item.to_dict())
+            self.data["favorites"].insert(0, stamped(item))
             self._fav_keys.add(item.key)
             added = True
         self.save()
@@ -98,6 +133,93 @@ class Store:
         h = [d for d in self.data["history"] if S.item_from_dict(d).key != item.key]
         self.data["history"] = [item.to_dict()] + h[:299]
         self.save()
+
+    # -- playlists
+    def _playlist(self, name: str) -> dict | None:
+        return next((p for p in self.data["playlists"] if p["name"] == name), None)
+
+    def _name_free(self, name: str) -> bool:
+        return bool(name) and all(p["name"].casefold() != name.casefold() for p in self.data["playlists"])
+
+    def playlist_names(self) -> list[str]:
+        return [p["name"] for p in self.data["playlists"]]
+
+    def playlist_items(self, name: str) -> list[S.Item]:
+        p = self._playlist(name)
+        return self._items(p["items"]) if p else []
+
+    def create_playlist(self, name: str) -> bool:
+        name = name.strip()
+        if not self._name_free(name):
+            return False
+        self.data["playlists"].append({"name": name, "items": []})
+        self.save()
+        return True
+
+    def rename_playlist(self, old: str, new: str) -> bool:
+        new, p = new.strip(), self._playlist(old)
+        if p is None or not (self._name_free(new) or new.casefold() == old.casefold() and new):
+            return False
+        p["name"] = new
+        sort = self.data["sort"]
+        if f"pl:{old}" in sort:
+            sort[f"pl:{new}"] = sort.pop(f"pl:{old}")
+        self.save()
+        return True
+
+    def delete_playlist(self, name: str) -> None:
+        self.data["playlists"] = [p for p in self.data["playlists"] if p["name"] != name]
+        self.data["sort"].pop(f"pl:{name}", None)
+        self.save()
+
+    def add_to_playlist(self, name: str, item: S.Item) -> bool:
+        p = self._playlist(name)
+        if p is None or any(S.item_from_dict(d).key == item.key for d in p["items"]):
+            return False
+        p["items"].append(stamped(item))
+        self.save()
+        return True
+
+    def remove_from_playlist(self, name: str, item: S.Item) -> None:
+        p = self._playlist(name)
+        if p is not None:
+            p["items"] = [d for d in p["items"] if S.item_from_dict(d).key != item.key]
+            self.save()
+
+    # -- ordering ("favs" or "pl:<name>")
+    def _list(self, which: str) -> list[dict]:
+        if which == "favs":
+            return self.data["favorites"]
+        p = self._playlist(which[3:])
+        return p["items"] if p else []
+
+    def keys(self, which: str) -> list[str]:
+        """Item keys in stored order."""
+        return [S.item_from_dict(d).key for d in self._list(which)]
+
+    def move(self, which: str, index: int, delta: int) -> int:
+        """Move one entry by delta places in the stored order; returns where it ended up."""
+        lst = self._list(which)
+        if not 0 <= index < len(lst):
+            return index
+        to = max(0, min(len(lst) - 1, index + delta))
+        if to != index:
+            lst.insert(to, lst.pop(index))
+            self.save()
+        return to
+
+    def get_sort(self, which: str) -> str:
+        mode = self.data["sort"].get(which, "custom")
+        return mode if mode in SORT_MODES else "custom"
+
+    def set_sort(self, which: str, mode: str) -> None:
+        self.data["sort"][which] = mode
+        self.save()
+
+    def next_sort(self, which: str) -> str:
+        mode = SORT_MODES[(SORT_MODES.index(self.get_sort(which)) + 1) % len(SORT_MODES)]
+        self.set_sort(which, mode)
+        return mode
 
 
 # ------------------------------------------------------------------ widgets
@@ -122,12 +244,15 @@ class Browser(Vertical):
     MAX_HISTORY = 50
 
     def __init__(self, categories: list[tuple[str | None, str]], load: Callable[[str], list[S.Item]],
-                 search: Callable[[str], list[S.Item]], placeholder: str, **kw) -> None:
+                 search: Callable[[str], list[S.Item]], placeholder: str,
+                 list_of: Callable[[str], str | None] = lambda key: None, **kw) -> None:
         super().__init__(**kw)
         self.categories, self._load, self._search, self.placeholder = categories, load, search, placeholder
+        self.list_of = list_of  # category key -> stored list it shows ("favs", "pl:<name>"), for sort / reorder
         self.items: list[S.Item] = []
         self.title_text = ""
-        self.stack: list[tuple[str, list[S.Item], int, int | None]] = []  # title, items, row, sidebar
+        self.view_key: str | None = None  # category key of the shown list; None for search / drilled-in views
+        self.stack: list[tuple[str, list[S.Item], int, int | None, str | None]] = []  # title, items, row, sidebar, view
         self.busy = False  # not `loading`: that is Widget.loading, whose overlay steals focus and blocks back
         self.refocus = False
 
@@ -140,6 +265,7 @@ class Browser(Vertical):
                 with Horizontal(classes="bar"):
                     yield Static("", classes="crumb")
                     yield Button("☆ Fav", id="fav-btn", compact=True, tooltip="Add / remove favourite (f)")
+                    yield Button("+ Playlist", id="pl-btn", compact=True, tooltip="Add to a playlist (a)")
                     yield Button("⧉ Copy ID", id="copy-btn", compact=True,
                                  tooltip="Copy a shareable ID (c); paste one in any search box to open it")
                 yield ItemTable(cursor_type="row", zebra_stripes=True)
@@ -164,8 +290,48 @@ class Browser(Vertical):
     def crumb(self, text: str) -> None:
         self.query_one(".crumb", Static).update(Text(text))
 
+    @property
+    def list_id(self) -> str | None:
+        """The stored list (favourites / a playlist) this view shows, if any."""
+        return self.list_of(self.view_key) if self.view_key else None
+
+    def show_crumb(self) -> None:
+        if not self.title_text:
+            return self.crumb("")
+        depth = "  ‹ backspace" if self.stack else ""
+        lid = self.list_id
+        sort = f"  ·  sort: {SORT_LABELS[self.app.store.get_sort(lid)]}" if lid else ""  # type: ignore[attr-defined]
+        self.crumb(f"{self.title_text}  ·  {len(self.items)} results{sort}{depth}")
+
+    def set_categories(self, categories: list[tuple[str | None, str]]) -> None:
+        """Replace the sidebar (playlists change while the app runs), keeping the highlight on the same key."""
+        keep = self.highlighted_category()
+        self.categories = categories
+        sidebar = self.query_one(OptionList)
+        sidebar.clear_options()
+        sidebar.add_options([Option(label, id=key, disabled=key is None) for key, label in categories])
+        keys = [k for k, _ in categories]
+        sidebar.highlighted = keys.index(keep) if keep in keys else next((i for i, k in enumerate(keys) if k), None)
+
+    def highlighted_category(self) -> str | None:
+        sidebar = self.query_one(OptionList)
+        return sidebar.get_option_at_index(sidebar.highlighted).id if sidebar.highlighted is not None else None
+
+    def reload(self, focus_key: str | None = None) -> None:
+        """Rebuild the shown favourites / playlist list in place (it is local, so no worker)."""
+        if not self.view_key:
+            return
+        cur = self.highlighted()
+        focus_key = focus_key or (cur.key if cur else None)
+        self.items = self._load(self.view_key)
+        self.refresh_rows()
+        row = next((i for i, it in enumerate(self.items) if it.key == focus_key), None)
+        if row is not None:
+            self.table.move_cursor(row=row, animate=False)
+        self.show_crumb()
+
     # -- loading
-    def load_into(self, title: str, fn: Loader, push: bool = False) -> None:
+    def load_into(self, title: str, fn: Loader, push: bool = False, view_key: str | None = None) -> None:
         self.crumb(f"{title}  ·  loading…")
         self.busy = True
         # Refilling the table can briefly hide it, which moves focus to the search box; give it back after.
@@ -173,7 +339,7 @@ class Browser(Vertical):
         # Every navigation (search, category, drill-in) remembers the view it leaves, so back returns to it.
         has_view = bool(self.title_text) and not self.title_text.endswith("failed")
         prev = (self.title_text, self.items, self.table.cursor_row,
-                self.query_one(OptionList).highlighted) if push and has_view else None
+                self.query_one(OptionList).highlighted, self.view_key) if push and has_view else None
 
         def work() -> None:
             worker = get_current_worker()
@@ -184,7 +350,7 @@ class Browser(Vertical):
                     self.app.call_from_thread(self._failed, title, e, prev)
                 return
             if not worker.is_cancelled:
-                self.app.call_from_thread(self._show, title, items, prev)
+                self.app.call_from_thread(self._show, title, items, prev, view_key)
 
         self.run_worker(work, thread=True, exclusive=True, group="load")
 
@@ -196,17 +362,16 @@ class Browser(Vertical):
         self.crumb(f"{self.title_text}" if prev else f"{title}  ·  failed")
         self.app.notify(f"{title}: {err}", title="Couldn't load", severity="error", timeout=6)
 
-    def _show(self, title: str, items: list[S.Item], prev=None) -> None:
+    def _show(self, title: str, items: list[S.Item], prev=None, view_key: str | None = None) -> None:
         if prev is not None:
             self.stack.append(prev)
             del self.stack[:-self.MAX_HISTORY]
-        self.items, self.title_text, self.busy = items, title, False
+        self.items, self.title_text, self.view_key, self.busy = items, title, view_key, False
         self.refresh_rows()
         if self.refocus:
             self.refocus = False
             self.call_after_refresh(self.table.focus)
-        depth = "  ‹ backspace" if self.stack else ""
-        self.crumb(f"{title}  ·  {len(items)} results{depth}")
+        self.show_crumb()
         if items:
             self.table.move_cursor(row=0)
 
@@ -244,26 +409,26 @@ class Browser(Vertical):
         if self.busy:  # back while loading = cancel, and stay on the list that is still shown
             self.workers.cancel_group(self, "load")
             self.busy = False
-            depth = "  ‹ backspace" if self.stack else ""
-            self.crumb(f"{self.title_text}  ·  {len(self.items)} results{depth}" if self.title_text else "")
+            self.show_crumb()
             return
         if self.stack:
-            title, items, cursor, side = self.stack.pop()
-            self.items, self.title_text = items, title
+            title, items, cursor, side, view = self.stack.pop()
+            self.items, self.title_text, self.view_key = items, title, view
             self.refresh_rows()
             if items:
                 self.table.move_cursor(row=min(cursor, len(items) - 1), animate=False)
             if side is not None:
                 self.query_one(OptionList).highlighted = side
-            depth = "  ‹ backspace" if self.stack else ""
-            self.crumb(f"{title}  ·  {len(items)} results{depth}")
+            if view:  # the stored list may have changed (sorted, reordered, removed from) since
+                self.reload()
+            self.show_crumb()
 
     def key_escape(self) -> None:
         self.table.focus()
 
     def open_category(self, key: str, push: bool = False) -> None:
         label = next(l for k, l in self.categories if k == key).strip()
-        self.load_into(label, lambda: self._load(key), push=push)
+        self.load_into(label, lambda: self._load(key), push=push, view_key=key if self.list_of(key) else None)
 
     def highlighted(self) -> S.Item | None:
         r = self.table.cursor_row
@@ -276,7 +441,7 @@ class Browser(Vertical):
     def category_item(self) -> S.Item | None:
         """The highlighted sidebar category as a favouritable/shareable item (e.g. Radio › Jazz)."""
         opt = self.query_one(OptionList)
-        if opt.highlighted is None or self.tab in ("favs", "history"):
+        if opt.highlighted is None or self.tab in ("favs", "playlists", "history"):
             return None
         key = opt.get_option_at_index(opt.highlighted).id
         if not key:
@@ -298,11 +463,14 @@ class Browser(Vertical):
         fav = self.query_one("#fav-btn", Button)
         fav.label = "★ Unfav" if it and app.store.is_fav(it) else "☆ Fav"
         fav.disabled = self.query_one("#copy-btn", Button).disabled = it is None
+        self.query_one("#pl-btn", Button).disabled = it is None or it.kind == "folder" and not it.ref
 
     # -- events
     @on(OptionList.OptionSelected)
     def _category(self, ev: OptionList.OptionSelected) -> None:
-        if ev.option_id:
+        if ev.option_id == NEW_PLAYLIST:
+            self.app.action_new_playlist()  # type: ignore[attr-defined]
+        elif ev.option_id:
             self.refocus = True
             self.open_category(ev.option_id, push=True)
 
@@ -316,6 +484,11 @@ class Browser(Vertical):
     def _fav_pressed(self, ev: Button.Pressed) -> None:
         ev.stop()
         self.app.action_fav()  # type: ignore[attr-defined]
+
+    @on(Button.Pressed, "#pl-btn")
+    def _pl_pressed(self, ev: Button.Pressed) -> None:
+        ev.stop()
+        self.app.action_add_to_playlist()  # type: ignore[attr-defined]
 
     @on(Button.Pressed, "#copy-btn")
     def _copy_pressed(self, ev: Button.Pressed) -> None:
@@ -390,6 +563,70 @@ class NowPlaying(Static):
 
 
 # ------------------------------------------------------------------ app
+
+# ------------------------------------------------------------------ popups
+
+class PlaylistPicker(ModalScreen[Optional[str]]):
+    """Choose a playlist to add to, or "+ New playlist…". Dismisses with the name, NEW_PLAYLIST or None."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, title: str, names: list[str]) -> None:
+        super().__init__()
+        self.title_text, self.names = title, names
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(Text(f"Add “{self.title_text[:50]}” to:"))
+            yield OptionList(*[Option(n, id=f"pl:{n}") for n in self.names],
+                             Option("+ New playlist…", id=NEW_PLAYLIST))
+
+    @on(OptionList.OptionSelected)
+    def _picked(self, ev: OptionList.OptionSelected) -> None:
+        oid = ev.option_id or ""
+        self.dismiss(oid if oid == NEW_PLAYLIST else oid[3:])
+
+
+class NamePrompt(ModalScreen[Optional[str]]):
+    """Ask for a playlist name; dismisses with the text, or None on escape."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, prompt: str, value: str = "") -> None:
+        super().__init__()
+        self.prompt, self.value = prompt, value
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(self.prompt)
+            yield Input(value=self.value, placeholder="Playlist name")
+            yield Label("enter to save · esc to cancel", classes="hint")
+
+    @on(Input.Submitted)
+    def _submitted(self, ev: Input.Submitted) -> None:
+        ev.stop()
+        if ev.value.strip():
+            self.dismiss(ev.value.strip())
+
+
+class Confirm(ModalScreen[bool]):
+    BINDINGS = [Binding("escape,n", "dismiss(False)", "No"), Binding("y", "dismiss(True)", "Yes")]
+
+    def __init__(self, question: str) -> None:
+        super().__init__()
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(Text(self.question))
+            with Horizontal(classes="buttons"):
+                yield Button("Yes (y)", id="yes", variant="error", compact=True)
+                yield Button("No (n)", id="no", compact=True)
+
+    @on(Button.Pressed)
+    def _pressed(self, ev: Button.Pressed) -> None:
+        self.dismiss(ev.button.id == "yes")
+
 
 def radio_categories() -> list[tuple[str | None, str]]:
     genres = ["pop", "rock", "jazz", "classical", "electronic", "dance", "house", "techno", "trance",
@@ -497,6 +734,14 @@ class TermRadio(App):
     .bar Button { margin-left: 1; min-width: 9; }
     ItemTable { height: 1fr; }
     NowPlaying { height: 3; padding: 0 1; background: $boost; border-top: hkey $accent; }
+    ModalScreen { align: center middle; }
+    .dialog { width: 60; height: auto; max-height: 80%; padding: 1 2; background: $surface;
+              border: thick $accent; }
+    .dialog OptionList { height: auto; max-height: 20; margin-top: 1; }
+    .dialog Input { margin-top: 1; }
+    .dialog .hint { color: $text-muted; }
+    .dialog .buttons { height: auto; margin-top: 1; }
+    .dialog .buttons Button { margin-right: 2; }
     """
     BINDINGS = [
         Binding("slash", "search", "Search"),
@@ -513,12 +758,19 @@ class TermRadio(App):
         Binding("full_stop", "seek(5000)", "+5s", show=False),
         Binding("f", "fav", "Fav"),
         Binding("c", "copy_id", "Copy ID"),
+        Binding("a", "add_to_playlist", "+Playlist"),
+        Binding("o", "sort", "Sort", show=False),
+        Binding("shift+up", "move(-1)", show=False),
+        Binding("shift+down", "move(1)", show=False),
+        Binding("delete", "remove", show=False),
+        Binding("r", "rename_playlist", show=False),
         Binding("t", "sleep", "Sleep"),
         Binding("1", "tab('radio')", show=False),
         Binding("2", "tab('music')", show=False),
         Binding("3", "tab('podcasts')", show=False),
         Binding("4", "tab('favs')", show=False),
         Binding("5", "tab('history')", show=False),
+        Binding("6", "tab('playlists')", show=False),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -559,10 +811,15 @@ class TermRadio(App):
                                ("fav:podcast", "Podcasts"), ("fav:episode", "Episodes"), ("fav:album", "Albums & playlists"),
                                ("fav:folder", "Groups & categories")],
                               self.load_favs, lambda q: self.filter_store("favorites", q),
-                              "Filter favourites…  (f / ☆ Fav on a row or category; paste a shared ID)")
+                              "Filter favourites…  (f / ☆ Fav on a row or category; paste a shared ID)",
+                              list_of=lambda k: "favs")
             with TabPane("5 History", id="history"):
                 yield Browser([("hist:all", "Recently played")], lambda k: self.store.items("history"),
                               lambda q: self.filter_store("history", q), "Filter history…")
+            with TabPane("6 Playlists", id="playlists"):
+                yield Browser(self.playlist_categories(), self.load_playlist, self.search_playlists,
+                              "Search all playlists…  (a / + Playlist on any row adds it to one)",
+                              list_of=lambda k: k if k.startswith("pl:") else None)
         yield NowPlaying()
         yield Footer()
 
@@ -599,8 +856,35 @@ class TermRadio(App):
     # -- favourites / history
     def load_favs(self, key: str) -> list[S.Item]:
         kind = key.split(":")[1]
-        items = self.store.items("favorites")
+        items = sort_items(self.store.items("favorites"), self.store.get_sort("favs"))
         return items if kind == "all" else [i for i in items if i.kind == kind]
+
+    def playlist_categories(self) -> list[tuple[str | None, str]]:
+        return [(f"pl:{n}", n) for n in self.store.playlist_names()] + [(NEW_PLAYLIST, "+ New playlist…")]
+
+    def load_playlist(self, key: str) -> list[S.Item]:
+        if key == NEW_PLAYLIST:
+            return []
+        return sort_items(self.store.playlist_items(key[3:]), self.store.get_sort(key))
+
+    def search_playlists(self, q: str) -> list[S.Item]:
+        q, seen, out = q.lower(), set(), []
+        for name in self.store.playlist_names():
+            for i in self.store.playlist_items(name):
+                if i.key not in seen and q in f"{i.title} {i.subtitle} {i.info} {name}".lower():
+                    seen.add(i.key)
+                    out.append(i)
+        return out
+
+    def refresh_playlists(self, select: str | None = None) -> None:
+        """Rebuild the Playlists sidebar; optionally highlight and open one playlist in it."""
+        b = self.browser("playlists")
+        b.set_categories(self.playlist_categories())
+        if select is not None:
+            b.query_one(OptionList).highlighted = [k for k, _ in b.categories].index(f"pl:{select}")
+            b.open_category(f"pl:{select}")
+        elif b.view_key and b.view_key not in [k for k, _ in b.categories]:
+            b.open_category(b.highlighted_category() or NEW_PLAYLIST)  # the shown playlist was deleted
 
     def filter_store(self, name: str, q: str) -> list[S.Item]:
         q = q.lower()
@@ -620,6 +904,9 @@ class TermRadio(App):
         if tab in ("favs", "history"):
             b = self.browser(tab)
             b.open_category(next(k for k, _ in b.categories if k))
+        elif tab == "playlists":  # items may have been added from other tabs
+            b = self.browser(tab)
+            b.open_category(b.highlighted_category() or NEW_PLAYLIST)
         self.call_after_refresh(self._focus_pane, tab)
 
     def _focus_pane(self, tab: str) -> None:
@@ -811,6 +1098,116 @@ class TermRadio(App):
         if not added and self.query_one(TabbedContent).active == "favs":
             b.items = [i for i in b.items if i.key != it.key]
         self.refresh_all_rows()
+
+    def action_add_to_playlist(self) -> None:
+        it = self.browser().target() or self.current
+        if not it or it.kind == "folder" and not it.ref:
+            self.notify("Nothing selected to add.", severity="warning", timeout=2)
+            return
+
+        def picked(name: str | None) -> None:
+            if name == NEW_PLAYLIST:
+                self.action_new_playlist(it)
+            elif name:
+                self._add(name, it)
+
+        self.push_screen(PlaylistPicker(it.title, self.store.playlist_names()), picked)
+
+    def _add(self, name: str, it: S.Item) -> None:
+        if self.store.add_to_playlist(name, it):
+            self.notify(f"Added {it.title} to {name}", timeout=2)
+        else:
+            self.notify(f"{it.title} is already in {name}", timeout=2)
+        pl = self.browser("playlists")
+        if pl.view_key == f"pl:{name}":
+            pl.reload()
+
+    def action_new_playlist(self, then_add: S.Item | None = None) -> None:
+        def named(name: str | None) -> None:
+            if not name:
+                return
+            if not self.store.create_playlist(name):
+                self.notify(f"A playlist called {name} already exists.", severity="warning", timeout=3)
+                return
+            self.refresh_playlists(select=name)
+            if then_add:
+                self._add(name, then_add)
+            else:
+                self.notify(f"Created {name}. Press a on any row to add to it.", timeout=3)
+
+        self.push_screen(NamePrompt("New playlist name:"), named)
+
+    def _sidebar_playlist(self, b: Browser) -> str | None:
+        """The playlist highlighted in the Playlists sidebar."""
+        key = b.highlighted_category()
+        return key[3:] if b.tab == "playlists" and key and key.startswith("pl:") else None
+
+    def action_rename_playlist(self) -> None:
+        b = self.browser()
+        old = self._sidebar_playlist(b)
+        if not old:
+            return
+
+        def named(new: str | None) -> None:
+            if not new or new == old:
+                return
+            if not self.store.rename_playlist(old, new):
+                self.notify(f"A playlist called {new} already exists.", severity="warning", timeout=3)
+                return
+            self.refresh_playlists(select=new)
+
+        self.push_screen(NamePrompt("Rename playlist:", old), named)
+
+    def action_remove(self) -> None:
+        b = self.browser()
+        f = self.focused
+        if isinstance(f, OptionList) and b in f.ancestors:  # sidebar: delete the whole playlist
+            name = self._sidebar_playlist(b)
+            if not name:
+                return
+            count = len(self.store.playlist_items(name))
+
+            def answered(yes: bool | None) -> None:
+                if yes:
+                    self.store.delete_playlist(name)
+                    self.refresh_playlists()
+                    self.notify(f"Deleted {name}", timeout=2)
+
+            self.push_screen(Confirm(f"Delete playlist “{name}” ({count} items)?"), answered)
+            return
+        lid, it = b.list_id, b.highlighted()
+        if lid and lid.startswith("pl:") and it:
+            self.store.remove_from_playlist(lid[3:], it)
+            row = b.table.cursor_row
+            nxt = b.items[row + 1] if row + 1 < len(b.items) else b.items[row - 1] if row > 0 else None
+            b.reload(focus_key=nxt.key if nxt else None)
+            self.notify(f"Removed {it.title}", timeout=2)
+
+    def action_sort(self) -> None:
+        b = self.browser()
+        if not b.list_id:
+            self.notify("Sorting works on favourites and playlists.", timeout=2)
+            return
+        mode = self.store.next_sort(b.list_id)
+        b.reload()
+        self.notify(f"Sort: {SORT_LABELS[mode]}", timeout=2)
+
+    def action_move(self, delta: int) -> None:
+        b = self.browser()
+        lid, it = b.list_id, b.highlighted()
+        if not lid or not it or not isinstance(self.focused, ItemTable):
+            return
+        if self.store.get_sort(lid) != "custom":
+            self.notify("Reordering needs the custom order: press o until the sort says custom.", timeout=3)
+            return
+        row = b.table.cursor_row + delta
+        if not 0 <= row < len(b.items):
+            return
+        # The view may be filtered (e.g. Favourites › Stations): move past the neighbour shown on screen.
+        keys = self.store.keys(lid)
+        i, j = keys.index(it.key), keys.index(b.items[row].key)
+        self.store.move(lid, i, j - i)
+        b.reload(focus_key=it.key)
 
     def action_copy_id(self) -> None:
         it = self.browser().target() or self.current

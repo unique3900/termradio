@@ -20,8 +20,9 @@ Needs Python 3.9+ and [VLC 3.x](https://www.videolan.org/vlc/) installed (the ap
 | **1 Radio** | Radio Browser, SomaFM, a curated list | ~50,000 live stations. Browse by genre, country or language, or see trending, most played and top voted. 49 hand-checked stations (Radio Paradise, KEXP, FIP, NTS, BBC World Service, WFMU, Swiss Jazz, Nightride…) and all ~46 SomaFM channels |
 | **2 Music** | Audius, Internet Archive, ccMixter | Full-length on-demand tracks. Audius has trending tracks by genre (36 genres) and playlists. Internet Archive has live concerts, Grateful Dead, netlabels, 78 RPM records, jazz and classical. ccMixter has Creative Commons tracks. Search covers all three |
 | **3 Podcasts** | Apple Podcasts directory + RSS, Internet Archive | Top charts in 20 categories, search for any podcast, full episode lists. Also LibriVox audiobooks and Old Time Radio. Episodes remember where you stopped |
-| **4 Favourites** | – | Anything you star with `f` or the ☆ Fav button: stations, tracks, albums, playlists, podcasts, episodes, and whole categories from the sidebar (e.g. Radio › Jazz) |
+| **4 Favourites** | – | Anything you star with `f` or the ☆ Fav button: stations, tracks, albums, playlists, podcasts, episodes, and whole categories from the sidebar (e.g. Radio › Jazz). Sort with `o`, reorder with `shift+↑/↓` |
 | **5 History** | – | The last 300 things you played |
+| **6 Playlists** | – | Your own playlists. Add any row from any tab with `a` or the + Playlist button (pick a playlist or create one). Sort with `o`, reorder with `shift+↑/↓`; playback follows the order shown |
 
 ## Keys
 
@@ -39,8 +40,13 @@ Needs Python 3.9+ and [VLC 3.x](https://www.videolan.org/vlc/) installed (the ap
 | mouse | click or drag the progress bar at the bottom to jump anywhere |
 | `f` | add / remove favourite |
 | `c` | copy a shareable ID for the selected item |
+| `a` | add the selected item to a playlist (or create a new one) |
+| `o` | sort favourites / a playlist: custom → name → date added → type → source |
+| `shift+↑` / `shift+↓` | move the highlighted row up / down (custom sort only) |
+| `delete` | remove the highlighted item from the playlist; on a playlist in the sidebar, delete the playlist |
+| `r` | rename the playlist highlighted in the sidebar |
 | `t` | sleep timer: 15 → 30 → 60 → 90 min → off |
-| `1`–`5` | switch tab |
+| `1`–`6` | switch tab |
 | `q` | quit |
 
 **Favourites and sharing.** `f` / ☆ Fav and `c` / ⧉ Copy ID act on the highlighted row, or on the
